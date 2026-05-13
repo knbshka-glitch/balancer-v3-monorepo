@@ -18,7 +18,7 @@ import { actionId } from '@balancer-labs/v3-helpers/src/models/misc/actions';
 describe('StablePoolAmplification', () => {
   const TOKEN_AMOUNT = fp(1000);
   const MIN_AMP = 1n;
-  const MAX_AMP = 5000n;
+  const MAX_AMP = 50000n;
   const AMP_PRECISION = 1000n;
   const INITIAL_AMPLIFICATION_PARAMETER = 200n;
 
@@ -51,7 +51,7 @@ describe('StablePoolAmplification', () => {
     const stopAmpUpdateAction = await actionId(pool, 'stopAmplificationParameterUpdate');
 
     const authorizerAddress = await vault.getAuthorizer();
-    const authorizer = await deployedAt('v3-solidity-utils/BasicAuthorizerMock', authorizerAddress);
+    const authorizer = await deployedAt('v3-vault/BasicAuthorizerMock', authorizerAddress);
 
     await authorizer.grantRole(startAmpUpdateAction, admin.address);
     await authorizer.grantRole(stopAmpUpdateAction, admin.address);
@@ -59,9 +59,13 @@ describe('StablePoolAmplification', () => {
 
   async function deployPool(amp: bigint) {
     pool = await deploy('StablePool', {
-      args: [{ name: 'Stable Pool', symbol: 'STABLE', amplificationParameter: amp }, await vault.getAddress()],
+      args: [
+        { name: 'Stable Pool', symbol: 'STABLE', amplificationParameter: amp, version: 'Stable Pool v1' },
+        await vault.getAddress(),
+      ],
     });
 
+    await vault.manualRegisterPoolWithSwapFee(pool, await tokens.addresses, fp(0.01));
     await grantPermission();
   }
 
@@ -225,7 +229,7 @@ describe('StablePoolAmplification', () => {
           });
 
           it('reverts when requesting above the max', async () => {
-            const highAmp = bn(5001);
+            const highAmp = bn(MAX_AMP + 1n);
             await expect(
               pool.connect(caller).startAmplificationParameterUpdate(highAmp, endTime)
             ).to.be.revertedWithCustomError(pool, 'AmplificationFactorTooHigh');

@@ -2,31 +2,67 @@
 
 pragma solidity ^0.8.24;
 
-import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
-import { IVault } from "@balancer-labs/v3-interfaces/contracts/vault/IVault.sol";
-import { IVaultErrors } from "@balancer-labs/v3-interfaces/contracts/vault/IVaultErrors.sol";
-import { SwapKind } from "@balancer-labs/v3-interfaces/contracts/vault/VaultTypes.sol";
+import { ISwapFeePercentageBounds } from "@balancer-labs/v3-interfaces/contracts/vault/ISwapFeePercentageBounds.sol";
+import {
+    IUnbalancedLiquidityInvariantRatioBounds
+} from "@balancer-labs/v3-interfaces/contracts/vault/IUnbalancedLiquidityInvariantRatioBounds.sol";
 import { IBasePool } from "@balancer-labs/v3-interfaces/contracts/vault/IBasePool.sol";
-import { IRateProvider } from "@balancer-labs/v3-interfaces/contracts/vault/IRateProvider.sol";
+import { IVault } from "@balancer-labs/v3-interfaces/contracts/vault/IVault.sol";
+import {
+    IStablePool,
+    StablePoolDynamicData,
+    StablePoolImmutableData,
+    AmplificationState
+} from "@balancer-labs/v3-interfaces/contracts/pool-stable/IStablePool.sol";
+import "@balancer-labs/v3-interfaces/contracts/vault/VaultTypes.sol";
 
+import { BasePoolAuthentication } from "@balancer-labs/v3-pool-utils/contracts/BasePoolAuthentication.sol";
 import { BalancerPoolToken } from "@balancer-labs/v3-vault/contracts/BalancerPoolToken.sol";
-import { BasePoolAuthentication } from "@balancer-labs/v3-vault/contracts/BasePoolAuthentication.sol";
 import { FixedPoint } from "@balancer-labs/v3-solidity-utils/contracts/math/FixedPoint.sol";
 import { StableMath } from "@balancer-labs/v3-solidity-utils/contracts/math/StableMath.sol";
-import { InputHelpers } from "@balancer-labs/v3-solidity-utils/contracts/helpers/InputHelpers.sol";
+import { Version } from "@balancer-labs/v3-solidity-utils/contracts/helpers/Version.sol";
+import { PoolInfo } from "@balancer-labs/v3-pool-utils/contracts/PoolInfo.sol";
 
-import { AmplificationDataLib, AmplificationDataBits, AmplificationData } from "./lib/AmplificationDataLib.sol";
-
-/// @notice Basic Stable Pool.
-contract StablePool is IBasePool, BalancerPoolToken, BasePoolAuthentication {
-    using AmplificationDataLib for AmplificationData;
+/**
+ * @notice Standard Balancer Stable Pool.
+ * @dev Stable Pools are designed for assets that are either expected to consistently swap at near parity,
+ * or at a known exchange rate. Stable Pools use `StableMath` (based on StableSwap, popularized by Curve),
+ * which allows for swaps of significant size before encountering substantial price impact, vastly
+ * increasing capital efficiency for like-kind and correlated-kind swaps.
+ *
+ * The `amplificationParameter` determines the "flatness" of the price curve. Higher values "flatten" the
+ * curve, meaning there is a larger range of balances over which tokens will trade near parity, with very low
+ * slippage. Generally, the `amplificationParameter` can be higher for tokens with lower volatility, and pools
+ * with higher liquidity. Lower values more closely approximate the "weighted" math curve, handling greater
+ * volatility at the cost of higher slippage. This parameter can be changed through permissioned calls
+ * (see below for details).
+ *
+ * The swap fee percentage is bounded by minimum and maximum values (same as were used in v2).
+ */
+contract StablePool is IStablePool, BalancerPoolToken, BasePoolAuthentication, PoolInfo, Version {
     using FixedPoint for uint256;
     using SafeCast for *;
 
+    /**
+     * @notice Parameters used to deploy a new Stable Pool.
+     * @param name ERC20 token name
+     * @param symbol ERC20 token symbol
+     * @param amplificationParameter Controls the "flatness" of the invariant curve. higher values = lower slippage,
+     * and assumes prices are near parity. lower values = closer to the constant product curve (e.g., more like a
+     * weighted pool). This has higher slippage, and accommodates greater price volatility
+     * @param version The stable pool version
+     */
+    struct NewPoolParams {
+        string name;
+        string symbol;
+        uint256 amplificationParameter;
+        string version;
+    }
+
     // This contract uses timestamps to slowly update its Amplification parameter over time. These changes must occur
-    // over a minimum time period much larger than the blocktime, making timestamp manipulation a non-issue.
+    // over a minimum time period much larger than the block time, making timestamp manipulation a non-issue.
     // solhint-disable not-rely-on-time
 
     // Amplification factor changes must happen over a minimum period of one day, and can at most divide or multiple the
@@ -37,43 +73,58 @@ contract StablePool is IBasePool, BalancerPoolToken, BasePoolAuthentication {
     uint256 private constant _MIN_UPDATE_TIME = 1 days;
     uint256 private constant _MAX_AMP_UPDATE_DAILY_RATE = 2;
 
-    /// @dev Store amplification state.
-    AmplificationDataBits private _amplificationState;
+    // Fees are 18-decimal, floating point values, which will be stored in the Vault using 24 bits.
+    // This means they have 0.00001% resolution (i.e., any non-zero bits < 1e11 will cause precision loss).
+    // Minimum values help make the math well-behaved (i.e., the swap fee should overwhelm any rounding error).
+    // Maximum values protect users by preventing permissioned actors from setting excessively high swap fees.
+    uint256 private constant _MIN_SWAP_FEE_PERCENTAGE = 1e12; // 0.0001%
+    uint256 private constant _MAX_SWAP_FEE_PERCENTAGE = 10e16; // 10%
 
-    /// @dev An amplification update has started.
+    /// @notice Store amplification state.
+    AmplificationState private _amplificationState;
+
+    /**
+     * @notice An amplification update has started.
+     * @param startValue Starting value of the amplification parameter
+     * @param endValue Ending value of the amplification parameter
+     * @param startTime Timestamp when the update starts
+     * @param endTime Timestamp when the update is complete
+     */
     event AmpUpdateStarted(uint256 startValue, uint256 endValue, uint256 startTime, uint256 endTime);
 
-    /// @dev An amplification update has been stopped.
+    /**
+     * @notice An amplification update has been stopped.
+     * @param currentValue The value at which it stopped
+     */
     event AmpUpdateStopped(uint256 currentValue);
 
-    /// @dev The amplification factor is below the minimum of the range (1 - 5000).
+    /// @notice The amplification factor is below the minimum of the range (1 - 50,000).
     error AmplificationFactorTooLow();
 
-    /// @dev The amplification factor is above the maximum of the range (1 - 5000).
+    /// @notice The amplification factor is above the maximum of the range (1 - 50,000).
     error AmplificationFactorTooHigh();
 
-    /// @dev The amplification change duration is too short.
+    /// @notice The amplification change duration is too short.
     error AmpUpdateDurationTooShort();
 
-    /// @dev The amplification change rate is too fast.
+    /// @notice The amplification change rate is too fast.
     error AmpUpdateRateTooFast();
 
-    /// @dev Amplification update operations must be done one at a time.
+    /// @notice Amplification update operations must be done one at a time.
     error AmpUpdateAlreadyStarted();
 
-    /// @dev Cannot stop an amplification update before it starts.
+    /// @notice Cannot stop an amplification update before it starts.
     error AmpUpdateNotStarted();
-
-    struct NewPoolParams {
-        string name;
-        string symbol;
-        uint256 amplificationParameter;
-    }
 
     constructor(
         NewPoolParams memory params,
         IVault vault
-    ) BalancerPoolToken(vault, params.name, params.symbol) BasePoolAuthentication(vault, msg.sender) {
+    )
+        BalancerPoolToken(vault, params.name, params.symbol)
+        BasePoolAuthentication(vault, msg.sender)
+        PoolInfo(vault)
+        Version(params.version)
+    {
         if (params.amplificationParameter < StableMath.MIN_AMP) {
             revert AmplificationFactorTooLow();
         }
@@ -82,46 +133,76 @@ contract StablePool is IBasePool, BalancerPoolToken, BasePoolAuthentication {
         }
 
         uint256 initialAmp = params.amplificationParameter * StableMath.AMP_PRECISION;
-
-        _setAmplificationData(initialAmp);
+        _stopAmplification(initialAmp);
     }
 
     /// @inheritdoc IBasePool
-    function getPoolTokens() public view returns (IERC20[] memory tokens) {
-        return getVault().getPoolTokens(address(this));
-    }
-
-    /// @inheritdoc IBasePool
-    function computeInvariant(uint256[] memory balancesLiveScaled18) public view returns (uint256) {
+    function computeInvariant(
+        uint256[] memory balancesLiveScaled18,
+        Rounding rounding
+    ) external view returns (uint256 invariant) {
         (uint256 currentAmp, ) = _getAmplificationParameter();
 
-        return StableMath.computeInvariant(currentAmp, balancesLiveScaled18);
+        (uint256 minBalance, uint256 maxBalance) = StableMath.getMinAndMaxBalances(balancesLiveScaled18);
+        StableMath.ensureBalancesWithinMaxImbalanceRange(minBalance, maxBalance);
+
+        invariant = _computeInvariant(balancesLiveScaled18, currentAmp, rounding);
+    }
+
+    /// @dev Internal version when the amp factor is already known.
+    function _computeInvariant(
+        uint256[] memory balancesLiveScaled18,
+        uint256 currentAmp,
+        Rounding rounding
+    ) internal pure returns (uint256 invariant) {
+        invariant = StableMath.computeInvariant(currentAmp, balancesLiveScaled18);
+
+        if (invariant > 0) {
+            invariant = rounding == Rounding.ROUND_DOWN ? invariant : invariant + 1;
+        }
     }
 
     /// @inheritdoc IBasePool
     function computeBalance(
         uint256[] memory balancesLiveScaled18,
         uint256 tokenInIndex,
-        uint256
+        uint256 invariantRatio
     ) external view returns (uint256 newBalance) {
-        (uint256 currentAmp, ) = _getAmplificationParameter();
+        (uint256 minBalance, uint256 maxBalance) = StableMath.getMinAndMaxBalances(balancesLiveScaled18);
 
-        return
-            StableMath.computeBalance(
-                currentAmp,
-                balancesLiveScaled18,
-                computeInvariant(balancesLiveScaled18),
-                tokenInIndex
-            );
+        (uint256 currentAmp, ) = _getAmplificationParameter();
+        newBalance = StableMath.computeBalance(
+            currentAmp,
+            balancesLiveScaled18,
+            _computeInvariant(balancesLiveScaled18, currentAmp, Rounding.ROUND_UP).mulUp(invariantRatio),
+            tokenInIndex
+        );
+
+        if (newBalance < minBalance) {
+            minBalance = newBalance;
+        } else if (newBalance > maxBalance) {
+            maxBalance = newBalance;
+        }
+
+        // It’s enough for us to check the imbalance once, because `computeBalance` will update
+        // balancesLiveScaled18[tokenInIndex]. By updating the min or max balance accordingly before the check, we are
+        // effectively checking the worst case scenario (which might happen either before or after the result of
+        // `computeBalance` is applied to pool balances).
+        StableMath.ensureBalancesWithinMaxImbalanceRange(minBalance, maxBalance);
     }
 
     /// @inheritdoc IBasePool
-    function onSwap(IBasePool.PoolSwapParams memory request) public view onlyVault returns (uint256) {
-        uint256 invariant = computeInvariant(request.balancesScaled18);
+    function onSwap(PoolSwapParams memory request) external view virtual returns (uint256 amountCalculatedScaled18) {
+        (uint256 minBalance, uint256 maxBalance) = StableMath.getMinAndMaxBalances(request.balancesScaled18);
+
         (uint256 currentAmp, ) = _getAmplificationParameter();
+        uint256 invariant = _computeInvariant(request.balancesScaled18, currentAmp, Rounding.ROUND_DOWN);
 
+        uint256 amountOutScaled18;
+        uint256 amountInScaled18;
         if (request.kind == SwapKind.EXACT_IN) {
-            uint256 amountOutScaled18 = StableMath.computeOutGivenExactIn(
+            amountInScaled18 = request.amountGivenScaled18;
+            amountOutScaled18 = StableMath.computeOutGivenExactIn(
                 currentAmp,
                 request.balancesScaled18,
                 request.indexIn,
@@ -129,10 +210,9 @@ contract StablePool is IBasePool, BalancerPoolToken, BasePoolAuthentication {
                 request.amountGivenScaled18,
                 invariant
             );
-
-            return amountOutScaled18;
+            amountCalculatedScaled18 = amountOutScaled18;
         } else {
-            uint256 amountInScaled18 = StableMath.computeInGivenExactOut(
+            amountInScaled18 = StableMath.computeInGivenExactOut(
                 currentAmp,
                 request.balancesScaled18,
                 request.indexIn,
@@ -140,19 +220,37 @@ contract StablePool is IBasePool, BalancerPoolToken, BasePoolAuthentication {
                 request.amountGivenScaled18,
                 invariant
             );
-
-            return amountInScaled18;
+            amountOutScaled18 = request.amountGivenScaled18;
+            amountCalculatedScaled18 = amountInScaled18;
         }
+
+        uint256 newBalanceIn = request.balancesScaled18[request.indexIn] + amountInScaled18;
+        uint256 newBalanceOut = request.balancesScaled18[request.indexOut] - amountOutScaled18;
+
+        // newBalanceIn >= request.balancesScaled18[request.indexIn] >= minBalance
+        // so we only check whether it goes above the original maximum balance.
+        if (newBalanceIn > maxBalance) {
+            maxBalance = newBalanceIn;
+        }
+
+        // newBalanceOut <= request.balancesScaled18[request.indexOut] <= maxBalance,
+        // so we only check whether it goes below the original minimum balance.
+        if (newBalanceOut < minBalance) {
+            minBalance = newBalanceOut;
+        }
+
+        // It’s enough for us to check the imbalance once, because `onSwap` will update
+        // balancesLiveScaled18[indexIn] (which will increase) and balancesLiveScaled18[indexOut] (which will decrease).
+        // By updating the min and / or max balance accordingly before the check, we are effectively checking the worst
+        // case scenario (which might happen either before or after the result of `onSwap` is applied to pool balances).
+        StableMath.ensureBalancesWithinMaxImbalanceRange(minBalance, maxBalance);
     }
 
-    /**
-     * @dev Begins changing the amplification parameter to `rawEndValue` over time. The value will change linearly until
-     * `endTime` is reached, when it will be `rawEndValue`.
-     *
-     * NOTE: Internally, the amplification parameter is represented using higher precision. The values returned by
-     * `getAmplificationParameter` have to be corrected to account for this when comparing to `rawEndValue`.
-     */
-    function startAmplificationParameterUpdate(uint256 rawEndValue, uint256 endTime) external authenticate {
+    /// @inheritdoc IStablePool
+    function startAmplificationParameterUpdate(
+        uint256 rawEndValue,
+        uint256 endTime
+    ) external onlySwapFeeManagerOrGovernance(address(this)) {
         if (rawEndValue < StableMath.MIN_AMP) {
             revert AmplificationFactorTooLow();
         }
@@ -183,35 +281,61 @@ contract StablePool is IBasePool, BalancerPoolToken, BasePoolAuthentication {
             revert AmpUpdateRateTooFast();
         }
 
-        _setAmplificationData(currentValue, endValue, block.timestamp, endTime);
+        // Values are 18 decimal floating point, which fits in 64 bits. Timestamps are 32 bits.
+        uint64 currentValueUint64 = currentValue.toUint64();
+        uint64 endValueUint64 = endValue.toUint64();
+        uint32 startTimeUint32 = block.timestamp.toUint32();
+        uint32 endTimeUint32 = endTime.toUint32();
+
+        _amplificationState.startValue = currentValueUint64;
+        _amplificationState.endValue = endValueUint64;
+        _amplificationState.startTime = startTimeUint32;
+        _amplificationState.endTime = endTimeUint32;
+
+        emit AmpUpdateStarted(currentValueUint64, endValueUint64, startTimeUint32, endTimeUint32);
+        _vault.emitAuxiliaryEvent(
+            "AmpUpdateStarted",
+            abi.encode(currentValueUint64, endValueUint64, startTimeUint32, endTimeUint32)
+        );
     }
 
-    /**
-     * @dev Stops the amplification parameter change process, keeping the current value.
-     */
-    function stopAmplificationParameterUpdate() external authenticate {
+    /// @inheritdoc IStablePool
+    function stopAmplificationParameterUpdate() external onlySwapFeeManagerOrGovernance(address(this)) {
         (uint256 currentValue, bool isUpdating) = _getAmplificationParameter();
 
         if (isUpdating == false) {
             revert AmpUpdateNotStarted();
         }
 
-        _setAmplificationData(currentValue);
+        _stopAmplification(currentValue);
+        _vault.emitAuxiliaryEvent("AmpUpdateStopped", abi.encode(currentValue));
     }
 
-    /**
-     * @notice Get all the amplifcation parameters.
-     * @return value Current amplification parameter value (could be in the middle of an update)
-     * @return isUpdating True if an amp update is in progress
-     * @return precision The raw value is multiplied by this number for greater precision during updates
-     */
+    /// @inheritdoc IStablePool
     function getAmplificationParameter() external view returns (uint256 value, bool isUpdating, uint256 precision) {
         (value, isUpdating) = _getAmplificationParameter();
         precision = StableMath.AMP_PRECISION;
     }
 
+    /// @inheritdoc IStablePool
+    function getAmplificationState()
+        external
+        view
+        returns (AmplificationState memory amplificationState, uint256 precision)
+    {
+        amplificationState = _amplificationState;
+        precision = StableMath.AMP_PRECISION;
+    }
+
     function _getAmplificationParameter() internal view returns (uint256 value, bool isUpdating) {
-        (uint256 startValue, uint256 endValue, uint256 startTime, uint256 endTime) = _getAmplificationData();
+        AmplificationState memory state = _amplificationState;
+
+        (uint256 startValue, uint256 endValue, uint256 startTime, uint256 endTime) = (
+            state.startValue,
+            state.endValue,
+            state.startTime,
+            state.endTime
+        );
 
         // Note that block.timestamp >= startTime, since startTime is set to the current time when an update starts
 
@@ -220,7 +344,7 @@ contract StablePool is IBasePool, BalancerPoolToken, BasePoolAuthentication {
 
             // We can skip checked arithmetic as:
             //  - block.timestamp is always larger or equal to startTime
-            //  - endTime is alawys larger than startTime
+            //  - endTime is always larger than startTime
             //  - the value delta is bounded by the largest amplification parameter, which never causes the
             //    multiplication to overflow.
             // This also means that the following computation will never revert nor yield invalid results.
@@ -243,37 +367,63 @@ contract StablePool is IBasePool, BalancerPoolToken, BasePoolAuthentication {
         }
     }
 
-    function _setAmplificationData(uint256 value) private {
-        _storeAmplificationData(value, value, block.timestamp, block.timestamp);
+    function _stopAmplification(uint256 value) internal {
+        uint64 currentValueUint64 = value.toUint64();
+        _amplificationState.startValue = currentValueUint64;
+        _amplificationState.endValue = currentValueUint64;
 
-        emit AmpUpdateStopped(value);
+        uint32 currentTime = block.timestamp.toUint32();
+        _amplificationState.startTime = currentTime;
+        _amplificationState.endTime = currentTime;
+
+        emit AmpUpdateStopped(currentValueUint64);
     }
 
-    function _setAmplificationData(uint256 startValue, uint256 endValue, uint256 startTime, uint256 endTime) private {
-        _storeAmplificationData(startValue, endValue, startTime, endTime);
-
-        emit AmpUpdateStarted(startValue, endValue, startTime, endTime);
+    /// @inheritdoc ISwapFeePercentageBounds
+    function getMinimumSwapFeePercentage() external pure returns (uint256) {
+        return _MIN_SWAP_FEE_PERCENTAGE;
     }
 
-    function _getAmplificationData()
-        private
-        view
-        returns (uint256 startValue, uint256 endValue, uint256 startTime, uint256 endTime)
-    {
-        AmplificationData memory data = _amplificationState.toAmpData();
-        startValue = data.startValue;
-        endValue = data.endValue;
-        startTime = data.startTime;
-        endTime = data.endTime;
+    /// @inheritdoc ISwapFeePercentageBounds
+    function getMaximumSwapFeePercentage() external pure returns (uint256) {
+        return _MAX_SWAP_FEE_PERCENTAGE;
     }
 
-    function _storeAmplificationData(uint256 startValue, uint256 endValue, uint256 startTime, uint256 endTime) private {
-        AmplificationData memory data;
-        data.startValue = startValue.toUint64();
-        data.endValue = endValue.toUint64();
-        data.startTime = startTime.toUint64();
-        data.endTime = endTime.toUint64();
+    /// @inheritdoc IUnbalancedLiquidityInvariantRatioBounds
+    function getMinimumInvariantRatio() external pure returns (uint256) {
+        return StableMath.MIN_INVARIANT_RATIO;
+    }
 
-        _amplificationState = data.fromAmpData();
+    /// @inheritdoc IUnbalancedLiquidityInvariantRatioBounds
+    function getMaximumInvariantRatio() external pure returns (uint256) {
+        return StableMath.MAX_INVARIANT_RATIO;
+    }
+
+    /// @inheritdoc IStablePool
+    function getStablePoolDynamicData() external view returns (StablePoolDynamicData memory data) {
+        data.balancesLiveScaled18 = _vault.getCurrentLiveBalances(address(this));
+        (, data.tokenRates) = _vault.getPoolTokenRates(address(this));
+        data.staticSwapFeePercentage = _vault.getStaticSwapFeePercentage((address(this)));
+        data.totalSupply = totalSupply();
+        data.bptRate = getRate();
+        (data.amplificationParameter, data.isAmpUpdating) = _getAmplificationParameter();
+
+        AmplificationState memory state = _amplificationState;
+        data.startValue = state.startValue;
+        data.endValue = state.endValue;
+        data.startTime = state.startTime;
+        data.endTime = state.endTime;
+
+        PoolConfig memory poolConfig = _vault.getPoolConfig(address(this));
+        data.isPoolInitialized = poolConfig.isPoolInitialized;
+        data.isPoolPaused = poolConfig.isPoolPaused;
+        data.isPoolInRecoveryMode = poolConfig.isPoolInRecoveryMode;
+    }
+
+    /// @inheritdoc IStablePool
+    function getStablePoolImmutableData() external view returns (StablePoolImmutableData memory data) {
+        data.tokens = _vault.getPoolTokens(address(this));
+        (data.decimalScalingFactors, ) = _vault.getPoolTokenRates(address(this));
+        data.amplificationParameterPrecision = StableMath.AMP_PRECISION;
     }
 }

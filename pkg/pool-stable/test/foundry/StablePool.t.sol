@@ -2,220 +2,311 @@
 
 pragma solidity ^0.8.24;
 
-import "forge-std/Test.sol";
-
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import { IERC20Errors } from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
-import { IRateProvider } from "@balancer-labs/v3-interfaces/contracts/vault/IRateProvider.sol";
+import { IAuthentication } from "@balancer-labs/v3-interfaces/contracts/solidity-utils/helpers/IAuthentication.sol";
+import { TokenConfig, PoolRoleAccounts } from "@balancer-labs/v3-interfaces/contracts/vault/VaultTypes.sol";
+import { IPoolInfo } from "@balancer-labs/v3-interfaces/contracts/pool-utils/IPoolInfo.sol";
 import { IVault } from "@balancer-labs/v3-interfaces/contracts/vault/IVault.sol";
-import { IVaultAdmin } from "@balancer-labs/v3-interfaces/contracts/vault/IVaultAdmin.sol";
-import { IVaultMain } from "@balancer-labs/v3-interfaces/contracts/vault/IVaultMain.sol";
-import { TokenConfig, PoolConfig } from "@balancer-labs/v3-interfaces/contracts/vault/VaultTypes.sol";
-import { IBasePool } from "@balancer-labs/v3-interfaces/contracts/vault/IBasePool.sol";
-import { IWETH } from "@balancer-labs/v3-interfaces/contracts/solidity-utils/misc/IWETH.sol";
+import { IVaultExtension } from "@balancer-labs/v3-interfaces/contracts/vault/IVaultExtension.sol";
+import {
+    IStablePool,
+    AmplificationState,
+    StablePoolImmutableData,
+    StablePoolDynamicData
+} from "@balancer-labs/v3-interfaces/contracts/pool-stable/IStablePool.sol";
 
-import { ArrayHelpers } from "@balancer-labs/v3-solidity-utils/contracts/helpers/ArrayHelpers.sol";
-import { BasicAuthorizerMock } from "@balancer-labs/v3-solidity-utils/contracts/test/BasicAuthorizerMock.sol";
-import { ERC20TestToken } from "@balancer-labs/v3-solidity-utils/contracts/test/ERC20TestToken.sol";
+import { CastingHelpers } from "@balancer-labs/v3-solidity-utils/contracts/helpers/CastingHelpers.sol";
 import { InputHelpers } from "@balancer-labs/v3-solidity-utils/contracts/helpers/InputHelpers.sol";
-import { StablePool } from "@balancer-labs/v3-pool-stable/contracts/StablePool.sol";
-import { Vault } from "@balancer-labs/v3-vault/contracts/Vault.sol";
-import { Router } from "@balancer-labs/v3-vault/contracts/Router.sol";
-import { VaultMock } from "@balancer-labs/v3-vault/contracts/test/VaultMock.sol";
-import { PoolConfigBits, PoolConfigLib } from "@balancer-labs/v3-vault/contracts/lib/PoolConfigLib.sol";
-import { StablePoolFactory } from "@balancer-labs/v3-pool-stable/contracts/StablePoolFactory.sol";
+import { ArrayHelpers } from "@balancer-labs/v3-solidity-utils/contracts/test/ArrayHelpers.sol";
+import { StableMath } from "@balancer-labs/v3-solidity-utils/contracts/math/StableMath.sol";
+import { BasePoolTest } from "@balancer-labs/v3-vault/test/foundry/utils/BasePoolTest.sol";
+import { PoolHooksMock } from "@balancer-labs/v3-vault/contracts/test/PoolHooksMock.sol";
 
-import { BaseVaultTest } from "vault/test/foundry/utils/BaseVaultTest.sol";
+import { StablePoolContractsDeployer } from "./utils/StablePoolContractsDeployer.sol";
+import { StablePoolFactory } from "../../contracts/StablePoolFactory.sol";
+import { StablePool } from "../../contracts/StablePool.sol";
 
-contract StablePoolTest is BaseVaultTest {
+contract StablePoolTest is BasePoolTest, StablePoolContractsDeployer {
+    using CastingHelpers for address[];
     using ArrayHelpers for *;
 
-    StablePoolFactory factory;
-
-    uint256 constant TOKEN_AMOUNT = 1e3 * 1e18;
-    uint256 constant TOKEN_AMOUNT_IN = 1 * 1e18;
-    uint256 constant TOKEN_AMOUNT_OUT = 1 * 1e18;
-
-    uint256 constant DELTA = 1e9;
-
+    string constant POOL_VERSION = "Pool v1";
     uint256 constant DEFAULT_AMP_FACTOR = 200;
-
-    StablePool internal stablePool;
-    uint256 internal bptAmountOut;
+    uint256 constant TOKEN_AMOUNT = 1e3 * 1e18;
 
     function setUp() public virtual override {
-        BaseVaultTest.setUp();
+        expectedAddLiquidityBptAmountOut = TOKEN_AMOUNT * 2;
+
+        BasePoolTest.setUp();
+
+        poolMinSwapFeePercentage = 1e12;
+        poolMaxSwapFeePercentage = 10e16;
     }
 
-    function createPool() internal override returns (address) {
-        factory = new StablePoolFactory(IVault(address(vault)), 365 days);
-        TokenConfig[] memory tokens = new TokenConfig[](2);
-        tokens[0].token = IERC20(dai);
-        tokens[1].token = IERC20(usdc);
+    function createPoolFactory() internal override returns (address) {
+        return address(deployStablePoolFactory(IVault(address(vault)), 365 days, "Factory v1", POOL_VERSION));
+    }
 
-        stablePool = StablePool(
-            factory.create("ERC20 Pool", "ERC20POOL", vault.sortTokenConfig(tokens), DEFAULT_AMP_FACTOR, ZERO_BYTES32)
+    function createPool() internal override returns (address newPool, bytes memory poolArgs) {
+        string memory name = "ERC20 Pool";
+        string memory symbol = "ERC20POOL";
+
+        TokenConfig[] memory tokenConfigs = new TokenConfig[](2);
+        IERC20[] memory sortedTokens = InputHelpers.sortTokens(
+            [address(dai), address(usdc)].toMemoryArray().asIERC20()
         );
-        return address(stablePool);
+        for (uint256 i = 0; i < sortedTokens.length; i++) {
+            poolTokens.push(sortedTokens[i]);
+            tokenConfigs[i].token = sortedTokens[i];
+
+            tokenAmounts.push(TOKEN_AMOUNT);
+        }
+
+        PoolRoleAccounts memory roleAccounts;
+        roleAccounts.swapFeeManager = alice;
+        roleAccounts.poolCreator = bob;
+
+        // Allow pools created by `factory` to use poolHooksMock hooks
+        PoolHooksMock(poolHooksContract).allowFactory(poolFactory);
+
+        newPool = StablePoolFactory(poolFactory).create(
+            name,
+            symbol,
+            tokenConfigs,
+            DEFAULT_AMP_FACTOR,
+            roleAccounts,
+            BASE_MIN_SWAP_FEE,
+            poolHooksContract,
+            false, // Do not enable donations
+            false, // Do not disable unbalanced add/remove liquidity
+            ZERO_BYTES32
+        );
+
+        // poolArgs is used to check pool deployment address with create2.
+        poolArgs = abi.encode(
+            StablePool.NewPoolParams({
+                name: name,
+                symbol: symbol,
+                amplificationParameter: DEFAULT_AMP_FACTOR,
+                version: POOL_VERSION
+            }),
+            vault
+        );
     }
 
     function initPool() internal override {
-        uint256[] memory amountsIn = [uint256(TOKEN_AMOUNT), uint256(TOKEN_AMOUNT)].toMemoryArray();
         vm.prank(lp);
         bptAmountOut = router.initialize(
             pool,
-            InputHelpers.sortTokens([address(dai), address(usdc)].toMemoryArray().asIERC20()),
-            amountsIn,
+            poolTokens,
+            tokenAmounts,
             // Account for the precision loss
-            TOKEN_AMOUNT - DELTA - 1e6,
+            expectedAddLiquidityBptAmountOut - BasePoolTest.DELTA,
             false,
             bytes("")
         );
     }
 
-    function testPoolPausedState() public {
-        (bool paused, uint256 pauseWindow, uint256 bufferPeriod, address pauseManager) = vault.getPoolPausedState(
-            address(pool)
+    function testGetBptRate() public {
+        uint256 invariantBefore = StableMath.computeInvariant(
+            DEFAULT_AMP_FACTOR * StableMath.AMP_PRECISION,
+            [TOKEN_AMOUNT, TOKEN_AMOUNT].toMemoryArray()
+        );
+        uint256 invariantAfter = StableMath.computeInvariant(
+            DEFAULT_AMP_FACTOR * StableMath.AMP_PRECISION,
+            [2 * TOKEN_AMOUNT, TOKEN_AMOUNT].toMemoryArray()
         );
 
-        assertFalse(paused);
-        assertApproxEqAbs(pauseWindow, START_TIMESTAMP + 365 days, 1);
-        assertApproxEqAbs(bufferPeriod, START_TIMESTAMP + 365 days + 30 days, 1);
-        assertEq(pauseManager, address(0));
+        uint256[] memory amountsIn = [TOKEN_AMOUNT, 0].toMemoryArray();
+        _testGetBptRate(invariantBefore, invariantAfter, amountsIn);
     }
 
-    function testInitialize() public {
-        // Tokens are transferred from lp
-        assertEq(defaultBalance - usdc.balanceOf(lp), TOKEN_AMOUNT, "LP: Wrong USDC balance");
-        assertEq(defaultBalance - dai.balanceOf(lp), TOKEN_AMOUNT, "LP: Wrong DAI balance");
+    function testAmplificationUpdateBySwapFeeManager() public {
+        // Ensure the swap manager was set for the pool.
+        assertEq(vault.getPoolRoleAccounts(pool).swapFeeManager, alice, "Wrong swap fee manager");
 
-        // Tokens are stored in the Vault
-        assertEq(usdc.balanceOf(address(vault)), TOKEN_AMOUNT, "Vault: Wrong USDC balance");
-        assertEq(dai.balanceOf(address(vault)), TOKEN_AMOUNT, "Vault: Wrong DAI balance");
-
-        // Tokens are deposited to the pool
-        (, , uint256[] memory balances, , ) = vault.getPoolTokenInfo(address(pool));
-        assertEq(balances[0], TOKEN_AMOUNT, "Pool: Wrong DAI balance");
-        assertEq(balances[1], TOKEN_AMOUNT, "Pool: Wrong USDC balance");
-
-        // should mint correct amount of BPT tokens
-        // Account for the precision loss
-        assertApproxEqAbs(stablePool.balanceOf(lp), bptAmountOut, DELTA, "LP: Wrong bptAmountOut");
-        assertApproxEqAbs(bptAmountOut, TOKEN_AMOUNT * 2, DELTA, "Wrong bptAmountOut");
-    }
-
-    function testAddLiquidity() public {
-        uint256[] memory amountsIn = [uint256(TOKEN_AMOUNT), uint256(TOKEN_AMOUNT)].toMemoryArray();
-        vm.prank(bob);
-        bptAmountOut = router.addLiquidityUnbalanced(address(pool), amountsIn, TOKEN_AMOUNT - DELTA, false, bytes(""));
-
-        // Tokens are transferred from Bob
-        assertEq(defaultBalance - usdc.balanceOf(bob), TOKEN_AMOUNT, "LP: Wrong USDC balance");
-        assertEq(defaultBalance - dai.balanceOf(bob), TOKEN_AMOUNT, "LP: Wrong DAI balance");
-
-        // Tokens are stored in the Vault
-        assertEq(usdc.balanceOf(address(vault)), TOKEN_AMOUNT * 2, "Vault: Wrong USDC balance");
-        assertEq(dai.balanceOf(address(vault)), TOKEN_AMOUNT * 2, "Vault: Wrong DAI balance");
-
-        // Tokens are deposited to the pool
-        (, , uint256[] memory balances, , ) = vault.getPoolTokenInfo(address(pool));
-        assertEq(balances[0], TOKEN_AMOUNT * 2, "Pool: Wrong DAI balance");
-        assertEq(balances[1], TOKEN_AMOUNT * 2, "Pool: Wrong USDC balance");
-
-        // should mint correct amount of BPT tokens
-        assertApproxEqAbs(stablePool.balanceOf(bob), bptAmountOut, DELTA, "LP: Wrong bptAmountOut");
-        assertApproxEqAbs(bptAmountOut, TOKEN_AMOUNT * 2, DELTA, "Wrong bptAmountOut");
-    }
-
-    function testRemoveLiquidity() public {
-        vm.startPrank(bob);
-        router.addLiquidityUnbalanced(
-            address(pool),
-            [uint256(TOKEN_AMOUNT), uint256(TOKEN_AMOUNT)].toMemoryArray(),
-            TOKEN_AMOUNT - DELTA,
-            false,
-            bytes("")
+        // Ensure the swap manager doesn't have permission through governance.
+        assertFalse(
+            authorizer.hasRole(
+                IAuthentication(pool).getActionId(StablePool.startAmplificationParameterUpdate.selector),
+                alice
+            ),
+            "Has governance-granted start permission"
+        );
+        assertFalse(
+            authorizer.hasRole(
+                IAuthentication(pool).getActionId(StablePool.stopAmplificationParameterUpdate.selector),
+                alice
+            ),
+            "Has governance-granted stop permission"
         );
 
-        stablePool.approve(address(vault), MAX_UINT256);
+        // Ensure the swap manager account can start/stop anyway.
+        uint256 currentTime = block.timestamp;
+        uint256 updateInterval = 5000 days;
 
-        uint256 bobBptBalance = stablePool.balanceOf(bob);
-        uint256 bptAmountIn = bobBptBalance;
+        uint256 endTime = currentTime + updateInterval;
+        uint256 newAmplificationParameter = DEFAULT_AMP_FACTOR * 2;
 
-        uint256[] memory amountsOut = router.removeLiquidityProportional(
-            address(pool),
-            bptAmountIn,
-            [uint256(less(TOKEN_AMOUNT, 1e4)), uint256(less(TOKEN_AMOUNT, 1e4))].toMemoryArray(),
-            false,
-            bytes("")
-        );
+        vm.startPrank(alice);
+        IStablePool(pool).startAmplificationParameterUpdate(newAmplificationParameter, endTime);
 
+        (, bool isUpdating, ) = IStablePool(pool).getAmplificationParameter();
+        assertTrue(isUpdating, "Amplification update not started");
+
+        IStablePool(pool).stopAmplificationParameterUpdate();
         vm.stopPrank();
 
-        // Tokens are transferred to Bob
-        assertApproxEqAbs(usdc.balanceOf(bob), defaultBalance, DELTA, "LP: Wrong USDC balance");
-        assertApproxEqAbs(dai.balanceOf(bob), defaultBalance, DELTA, "LP: Wrong DAI balance");
+        (, isUpdating, ) = IStablePool(pool).getAmplificationParameter();
+        assertFalse(isUpdating, "Amplification update not stopped");
 
-        // Tokens are stored in the Vault
-        assertApproxEqAbs(usdc.balanceOf(address(vault)), TOKEN_AMOUNT, DELTA, "Vault: Wrong USDC balance");
-        assertApproxEqAbs(dai.balanceOf(address(vault)), TOKEN_AMOUNT, DELTA, "Vault: Wrong DAI balance");
-
-        // Tokens are deposited to the pool
-        (, , uint256[] memory balances, , ) = vault.getPoolTokenInfo(address(pool));
-        assertApproxEqAbs(balances[0], TOKEN_AMOUNT, DELTA, "Pool: Wrong DAI balance");
-        assertApproxEqAbs(balances[1], TOKEN_AMOUNT, DELTA, "Pool: Wrong USDC balance");
-
-        // amountsOut are correct
-        assertApproxEqAbs(amountsOut[0], TOKEN_AMOUNT, DELTA, "Wrong DAI AmountOut");
-        assertApproxEqAbs(amountsOut[1], TOKEN_AMOUNT, DELTA, "Wrong USDC AmountOut");
-
-        // should mint correct amount of BPT tokens
-        assertEq(stablePool.balanceOf(bob), 0, "LP: Wrong BPT balance");
-        assertEq(bobBptBalance, bptAmountIn, "LP: Wrong bptAmountIn");
-    }
-
-    function testSwap() public {
-        vm.prank(bob);
-        uint256 amountCalculated = router.swapSingleTokenExactIn(
-            address(pool),
-            dai,
-            usdc,
-            TOKEN_AMOUNT_IN,
-            less(TOKEN_AMOUNT_OUT, 1e3),
-            MAX_UINT256,
-            false,
-            bytes("")
+        // Grant to Bob via governance.
+        authorizer.grantRole(
+            IAuthentication(pool).getActionId(StablePool.startAmplificationParameterUpdate.selector),
+            bob
         );
 
-        // Tokens are transferred from Bob
-        assertEq(usdc.balanceOf(bob), defaultBalance + amountCalculated, "LP: Wrong USDC balance");
-        assertEq(dai.balanceOf(bob), defaultBalance - TOKEN_AMOUNT_IN, "LP: Wrong DAI balance");
-
-        // Tokens are stored in the Vault
-        assertEq(usdc.balanceOf(address(vault)), TOKEN_AMOUNT - amountCalculated, "Vault: Wrong USDC balance");
-        assertEq(dai.balanceOf(address(vault)), TOKEN_AMOUNT + TOKEN_AMOUNT_IN, "Vault: Wrong DAI balance");
-
-        (, , uint256[] memory balances, , ) = vault.getPoolTokenInfo(address(pool));
-
-        (uint256 daiIdx, uint256 usdcIdx) = getSortedIndexes(address(dai), address(usdc));
-
-        assertEq(balances[daiIdx], TOKEN_AMOUNT + TOKEN_AMOUNT_IN, "Pool: Wrong DAI balance");
-        assertEq(balances[usdcIdx], TOKEN_AMOUNT - amountCalculated, "Pool: Wrong USDC balance");
+        vm.startPrank(bob);
+        vm.expectRevert(IAuthentication.SenderNotAllowed.selector);
+        IStablePool(pool).startAmplificationParameterUpdate(newAmplificationParameter, endTime);
     }
 
-    function less(uint256 amount, uint256 base) internal pure returns (uint256) {
-        return (amount * (base - 1)) / base;
-    }
+    function testAmplificationUpdateByGovernance() public {
+        PoolRoleAccounts memory poolRoleAccounts = PoolRoleAccounts({
+            pauseManager: address(0x00),
+            swapFeeManager: address(0x00),
+            poolCreator: address(0x00)
+        });
+        vm.mockCall(
+            address(vault),
+            abi.encodeWithSelector(IVaultExtension.getPoolRoleAccounts.selector, pool),
+            abi.encode(poolRoleAccounts)
+        );
 
-    function testAddLiquidityUnbalanced() public {
-        authorizer.grantRole(vault.getActionId(IVaultAdmin.setStaticSwapFeePercentage.selector), alice);
-        vm.prank(alice);
-        vault.setStaticSwapFeePercentage(address(pool), 10e16);
+        assertFalse(
+            authorizer.hasRole(
+                IAuthentication(pool).getActionId(StablePool.startAmplificationParameterUpdate.selector),
+                bob
+            ),
+            "Has governance-granted start permission"
+        );
+        assertFalse(
+            authorizer.hasRole(
+                IAuthentication(pool).getActionId(StablePool.stopAmplificationParameterUpdate.selector),
+                bob
+            ),
+            "Has governance-granted stop permission"
+        );
 
-        uint256[] memory amountsIn = [uint256(1e2 * 1e18), uint256(TOKEN_AMOUNT)].toMemoryArray();
+        // Ensure the swap manager account can start/stop anyway.
+        uint256 currentTime = block.timestamp;
+        uint256 updateInterval = 5000 days;
+
+        uint256 endTime = currentTime + updateInterval;
+        uint256 newAmplificationParameter = DEFAULT_AMP_FACTOR * 2;
+
+        // Test that the swap manager can't start/stop the update.
         vm.prank(bob);
+        vm.expectRevert(IAuthentication.SenderNotAllowed.selector);
+        IStablePool(pool).startAmplificationParameterUpdate(newAmplificationParameter, endTime);
 
-        router.addLiquidityUnbalanced(address(pool), amountsIn, 0, false, bytes(""));
+        // Grant to Bob via governance.
+        authorizer.grantRole(
+            IAuthentication(pool).getActionId(StablePool.startAmplificationParameterUpdate.selector),
+            bob
+        );
+        authorizer.grantRole(
+            IAuthentication(pool).getActionId(StablePool.stopAmplificationParameterUpdate.selector),
+            bob
+        );
+
+        vm.startPrank(bob);
+        IStablePool(pool).startAmplificationParameterUpdate(newAmplificationParameter, endTime);
+
+        (, bool isUpdating, ) = IStablePool(pool).getAmplificationParameter();
+        assertTrue(isUpdating, "Amplification update not started");
+
+        IStablePool(pool).stopAmplificationParameterUpdate();
+        vm.stopPrank();
+
+        (, isUpdating, ) = IStablePool(pool).getAmplificationParameter();
+        assertFalse(isUpdating, "Amplification update not stopped");
+    }
+
+    function testGetAmplificationState() public {
+        (AmplificationState memory ampState, uint256 precision) = IStablePool(pool).getAmplificationState();
+
+        // Should be initialized to the default values.
+        assertEq(ampState.startTime, block.timestamp, "Wrong initial amp update start time");
+        assertEq(ampState.endTime, block.timestamp, "Wrong initial amp update end time");
+        assertEq(ampState.startValue, DEFAULT_AMP_FACTOR * precision, "Wrong initial amp update start value");
+        assertEq(ampState.endValue, DEFAULT_AMP_FACTOR * precision, "Wrong initial amp update end value");
+
+        uint256 currentTime = block.timestamp;
+        uint256 updateInterval = 5000 days;
+
+        uint256 endTime = currentTime + updateInterval;
+        uint256 newAmplificationParameter = DEFAULT_AMP_FACTOR * 2;
+
+        vm.prank(alice);
+        IStablePool(pool).startAmplificationParameterUpdate(newAmplificationParameter, endTime);
+
+        vm.warp(currentTime + updateInterval + 1);
+
+        (ampState, precision) = IStablePool(pool).getAmplificationState();
+
+        // Should be initialized to the default values.
+        assertEq(ampState.startTime, currentTime, "Wrong amp update start time");
+        assertEq(ampState.endTime, endTime, "Wrong amp update end time");
+        assertEq(ampState.startValue, DEFAULT_AMP_FACTOR * precision, "Wrong amp update start value");
+        assertEq(ampState.endValue, newAmplificationParameter * precision, "Wrong amp update end value");
+    }
+
+    function testGetStablePoolImmutableData() public view {
+        StablePoolImmutableData memory data = IStablePool(pool).getStablePoolImmutableData();
+        (, , uint256 precision) = IStablePool(pool).getAmplificationParameter();
+        (uint256[] memory scalingFactors, ) = vault.getPoolTokenRates(pool);
+        IERC20[] memory tokens = IPoolInfo(pool).getTokens();
+
+        assertEq(data.amplificationParameterPrecision, precision, "Wrong amplification parameter precision");
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            assertEq(address(data.tokens[i]), address(tokens[i]), "Token mismatch");
+            assertEq(data.decimalScalingFactors[i], scalingFactors[i], "Decimal scaling factors mismatch");
+        }
+    }
+
+    function testGetStablePoolDynamicData() public view {
+        (AmplificationState memory ampState, uint256 precision) = IStablePool(pool).getAmplificationState();
+        StablePoolDynamicData memory data = IStablePool(pool).getStablePoolDynamicData();
+        (, uint256[] memory tokenRates) = vault.getPoolTokenRates(pool);
+        IERC20[] memory tokens = IPoolInfo(pool).getTokens();
+        uint256 totalSupply = IERC20(pool).totalSupply();
+        uint256 bptRate = vault.getBptRate(pool);
+
+        assertTrue(data.isPoolInitialized, "Pool not initialized");
+        assertFalse(data.isPoolPaused, "Pool paused");
+        assertFalse(data.isPoolInRecoveryMode, "Pool in Recovery Mode");
+
+        assertEq(data.amplificationParameter, DEFAULT_AMP_FACTOR * precision, "Amp factor mismatch");
+        assertEq(data.startValue, ampState.startValue, "Start value mismatch");
+        assertEq(data.endValue, ampState.endValue, "End value mismatch");
+        assertEq(data.startTime, ampState.startTime, "Start time mismatch");
+        assertEq(data.endTime, ampState.endTime, "End time mismatch");
+        assertEq(data.bptRate, bptRate, "BPT rate mismatch");
+        assertEq(data.totalSupply, totalSupply, "Total supply mismatch");
+
+        assertEq(data.staticSwapFeePercentage, BASE_MIN_SWAP_FEE, "Swap fee mismatch");
+
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            assertEq(data.balancesLiveScaled18[i], DEFAULT_AMOUNT, "Live balance mismatch");
+            assertEq(data.tokenRates[i], tokenRates[i], "Token rate mismatch");
+        }
+    }
+
+    function testPoolCreator() public view {
+        PoolRoleAccounts memory roleAccounts = vault.getPoolRoleAccounts(pool);
+
+        assertEq(roleAccounts.poolCreator, bob, "Wrong pool creator");
     }
 }

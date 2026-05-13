@@ -2,221 +2,201 @@
 
 pragma solidity ^0.8.24;
 
-import "forge-std/Test.sol";
-
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import { IERC20Errors } from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
-import { IRateProvider } from "@balancer-labs/v3-interfaces/contracts/vault/IRateProvider.sol";
-import { IVault } from "@balancer-labs/v3-interfaces/contracts/vault/IVault.sol";
-import { IVaultAdmin } from "@balancer-labs/v3-interfaces/contracts/vault/IVaultAdmin.sol";
-import { IVaultMain } from "@balancer-labs/v3-interfaces/contracts/vault/IVaultMain.sol";
-import { TokenConfig, PoolConfig } from "@balancer-labs/v3-interfaces/contracts/vault/VaultTypes.sol";
+import { IRateProvider } from "@balancer-labs/v3-interfaces/contracts/solidity-utils/helpers/IRateProvider.sol";
+import { TokenConfig, PoolRoleAccounts } from "@balancer-labs/v3-interfaces/contracts/vault/VaultTypes.sol";
+import { IVaultErrors } from "@balancer-labs/v3-interfaces/contracts/vault/IVaultErrors.sol";
+import { IPoolInfo } from "@balancer-labs/v3-interfaces/contracts/pool-utils/IPoolInfo.sol";
 import { IBasePool } from "@balancer-labs/v3-interfaces/contracts/vault/IBasePool.sol";
-import { IWETH } from "@balancer-labs/v3-interfaces/contracts/solidity-utils/misc/IWETH.sol";
+import { IVault } from "@balancer-labs/v3-interfaces/contracts/vault/IVault.sol";
+import "@balancer-labs/v3-interfaces/contracts/pool-weighted/IWeightedPool.sol";
 
-import { ArrayHelpers } from "@balancer-labs/v3-solidity-utils/contracts/helpers/ArrayHelpers.sol";
-import { BasicAuthorizerMock } from "@balancer-labs/v3-solidity-utils/contracts/test/BasicAuthorizerMock.sol";
-import { ERC20TestToken } from "@balancer-labs/v3-solidity-utils/contracts/test/ERC20TestToken.sol";
+import { CastingHelpers } from "@balancer-labs/v3-solidity-utils/contracts/helpers/CastingHelpers.sol";
 import { InputHelpers } from "@balancer-labs/v3-solidity-utils/contracts/helpers/InputHelpers.sol";
-import { WeightedPool } from "pool-weighted/contracts/WeightedPool.sol";
-import { Vault } from "@balancer-labs/v3-vault/contracts/Vault.sol";
-import { Router } from "@balancer-labs/v3-vault/contracts/Router.sol";
-import { VaultMock } from "@balancer-labs/v3-vault/contracts/test/VaultMock.sol";
-import { PoolConfigBits, PoolConfigLib } from "@balancer-labs/v3-vault/contracts/lib/PoolConfigLib.sol";
-import { WeightedPoolFactory } from "pool-weighted/contracts/WeightedPoolFactory.sol";
+import { MinTokenBalanceLib } from "@balancer-labs/v3-vault/contracts/lib/MinTokenBalanceLib.sol";
+import { ArrayHelpers } from "@balancer-labs/v3-solidity-utils/contracts/test/ArrayHelpers.sol";
+import { BasePoolTest } from "@balancer-labs/v3-vault/test/foundry/utils/BasePoolTest.sol";
+import { PoolHooksMock } from "@balancer-labs/v3-vault/contracts/test/PoolHooksMock.sol";
 
-import { BaseVaultTest } from "@balancer-labs/v3-vault/test/foundry/utils/BaseVaultTest.sol";
+import { WeightedPoolContractsDeployer } from "./utils/WeightedPoolContractsDeployer.sol";
+import { WeightedPoolFactory } from "../../contracts/WeightedPoolFactory.sol";
+import { WeightedPool } from "../../contracts/WeightedPool.sol";
 
-contract WeightedPoolTest is BaseVaultTest {
+contract WeightedPoolTest is WeightedPoolContractsDeployer, BasePoolTest {
+    using CastingHelpers for address[];
     using ArrayHelpers for *;
 
-    WeightedPoolFactory factory;
+    string constant POOL_VERSION = "Pool v1";
+    uint256 constant DEFAULT_SWAP_FEE = 1e16; // 1%
+    uint256 constant TOKEN_AMOUNT = 1e3 * 1e18;
 
-    uint256 constant USDC_AMOUNT = 1e3 * 1e18;
-    uint256 constant DAI_AMOUNT = 1e3 * 1e18;
+    uint256[] internal weights;
 
-    uint256 constant DAI_AMOUNT_IN = 1 * 1e18;
-    uint256 constant USDC_AMOUNT_OUT = 1 * 1e18;
-
-    uint256 constant DELTA = 1e9;
-
-    WeightedPool internal weightedPool;
-    uint256 internal bptAmountOut;
+    uint256 daiIdx;
+    uint256 usdcIdx;
 
     function setUp() public virtual override {
-        BaseVaultTest.setUp();
-        weightedPool = WeightedPool(pool);
+        expectedAddLiquidityBptAmountOut = TOKEN_AMOUNT;
+        tokenAmountIn = TOKEN_AMOUNT / 4;
+        isTestSwapFeeEnabled = false;
+
+        BasePoolTest.setUp();
+
+        (daiIdx, usdcIdx) = getSortedIndexes(address(dai), address(usdc));
+
+        poolMinSwapFeePercentage = 0.001e16; // 0.001%
+        poolMaxSwapFeePercentage = 10e16;
     }
 
-    function _createPool(address[] memory tokens, string memory label) internal virtual override returns (address) {
-        factory = new WeightedPoolFactory(IVault(address(vault)), 365 days);
-        WeightedPool newPool = WeightedPool(
-            factory.create(
-                "ERC20 Pool",
-                "ERC20POOL",
-                vault.buildTokenConfig(tokens.asIERC20()),
-                [uint256(0.50e18), uint256(0.50e18)].toMemoryArray(),
-                ZERO_BYTES32
-            )
+    function createPoolFactory() internal override returns (address) {
+        return address(deployWeightedPoolFactory(IVault(address(vault)), 365 days, "Factory v1", POOL_VERSION));
+    }
+
+    function createPool() internal override returns (address newPool, bytes memory poolArgs) {
+        string memory name = "ERC20 Pool";
+        string memory symbol = "ERC20POOL";
+
+        IERC20[] memory sortedTokens = InputHelpers.sortTokens(
+            [address(dai), address(usdc)].toMemoryArray().asIERC20()
         );
-        vm.label(address(newPool), label);
-        return address(newPool);
+        for (uint256 i = 0; i < sortedTokens.length; i++) {
+            poolTokens.push(sortedTokens[i]);
+            tokenAmounts.push(TOKEN_AMOUNT);
+        }
+
+        weights = [uint256(50e16), uint256(50e16)].toMemoryArray();
+
+        PoolRoleAccounts memory roleAccounts;
+        roleAccounts.poolCreator = alice;
+
+        // Allow pools created by `factory` to use poolHooksMock hooks
+        PoolHooksMock(poolHooksContract).allowFactory(poolFactory);
+
+        newPool = WeightedPoolFactory(poolFactory).create(
+            name,
+            symbol,
+            vault.buildTokenConfig(sortedTokens),
+            weights,
+            roleAccounts,
+            DEFAULT_SWAP_FEE,
+            poolHooksContract,
+            false, // Do not enable donations
+            false, // Do not disable unbalanced add/remove liquidity
+            ZERO_BYTES32
+        );
+
+        // poolArgs is used to check pool deployment address with create2.
+        poolArgs = abi.encode(
+            WeightedPool.NewPoolParams({
+                name: name,
+                symbol: symbol,
+                numTokens: sortedTokens.length,
+                normalizedWeights: weights,
+                version: POOL_VERSION,
+                minTokenBalances: defaultMinTokenBalances
+            }),
+            vault
+        );
     }
 
     function initPool() internal override {
         vm.startPrank(lp);
         bptAmountOut = _initPool(
             pool,
-            [uint256(DAI_AMOUNT), uint256(USDC_AMOUNT)].toMemoryArray(),
+            tokenAmounts,
             // Account for the precision loss
-            DAI_AMOUNT - DELTA - 1e6
+            expectedAddLiquidityBptAmountOut - DELTA
         );
         vm.stopPrank();
     }
 
-    function testPoolPausedState() public {
-        (bool paused, uint256 pauseWindow, uint256 bufferPeriod, address pauseManager) = vault.getPoolPausedState(
-            address(pool)
+    function testGetBptRate() public {
+        vm.expectRevert(WeightedPool.WeightedPoolBptRateUnsupported.selector);
+        IRateProvider(pool).getRate();
+    }
+
+    function testRevertsWhenSwapFeeTooLow() public {
+        TokenConfig[] memory tokenConfigs = new TokenConfig[](2);
+        tokenConfigs[daiIdx].token = IERC20(dai);
+        tokenConfigs[usdcIdx].token = IERC20(usdc);
+
+        PoolRoleAccounts memory roleAccounts;
+
+        uint256 minimumSwapFeePercentage = IBasePool(pool).getMinimumSwapFeePercentage();
+
+        vm.expectRevert(IVaultErrors.SwapFeePercentageTooLow.selector);
+        address lowFeeWeightedPool = WeightedPoolFactory(poolFactory).create(
+            "ERC20 Pool",
+            "ERC20POOL",
+            tokenConfigs,
+            [uint256(50e16), uint256(50e16)].toMemoryArray(),
+            roleAccounts,
+            minimumSwapFeePercentage - 1, // Swap fee too low
+            poolHooksContract,
+            false, // Do not enable donations
+            false, // Do not disable unbalanced add/remove liquidity
+            "Low fee pool"
         );
 
-        assertFalse(paused);
-        assertApproxEqAbs(pauseWindow, START_TIMESTAMP + 365 days, 1);
-        assertApproxEqAbs(bufferPeriod, START_TIMESTAMP + 365 days + 30 days, 1);
-        assertEq(pauseManager, address(0));
+        // The pool was not deployed, so the address is 0x0.
+        assertEq(address(lowFeeWeightedPool), address(0));
     }
 
-    function testInitialize() public {
-        // Tokens are transferred from lp
-        assertEq(defaultBalance - usdc.balanceOf(lp), USDC_AMOUNT, "LP: Wrong USDC balance");
-        assertEq(defaultBalance - dai.balanceOf(lp), DAI_AMOUNT, "LP: Wrong DAI balance");
+    function testGetWeightedPoolImmutableData() public view {
+        WeightedPoolImmutableData memory data = IWeightedPool(pool).getWeightedPoolImmutableData();
+        (uint256[] memory scalingFactors, ) = vault.getPoolTokenRates(pool);
+        IERC20[] memory tokens = IPoolInfo(pool).getTokens();
+        uint256 numTokens = tokens.length;
 
-        // Tokens are stored in the Vault
-        assertEq(usdc.balanceOf(address(vault)), USDC_AMOUNT, "Vault: Wrong USDC balance");
-        assertEq(dai.balanceOf(address(vault)), DAI_AMOUNT, "Vault: Wrong DAI balance");
+        uint256[] memory minTokenBalances = new uint256[](numTokens);
+        for (uint256 i = 0; i < numTokens; ++i) {
+            minTokenBalances[i] = _getMinTokenBalance(address(tokens[i]));
+        }
 
-        // Tokens are deposited to the pool
-        (, , uint256[] memory balances, , ) = vault.getPoolTokenInfo(address(pool));
-        assertEq(balances[0], DAI_AMOUNT, "Pool: Wrong DAI balance");
-        assertEq(balances[1], USDC_AMOUNT, "Pool: Wrong USDC balance");
-
-        // should mint correct amount of BPT tokens
-        // Account for the precision loss
-        assertApproxEqAbs(weightedPool.balanceOf(lp), bptAmountOut, DELTA, "LP: Wrong bptAmountOut");
-        assertApproxEqAbs(bptAmountOut, DAI_AMOUNT, DELTA, "Wrong bptAmountOut");
+        for (uint256 i = 0; i < numTokens; ++i) {
+            assertEq(address(data.tokens[i]), address(tokens[i]), "Token mismatch");
+            assertEq(data.decimalScalingFactors[i], scalingFactors[i], "Decimal scaling factors mismatch");
+            assertEq(data.normalizedWeights[i], uint256(50e16), "Weight mismatch");
+            assertEq(data.minTokenBalances[i], minTokenBalances[i], "Minimum token balance mismatch");
+        }
     }
 
-    function testAddLiquidity() public {
-        uint256[] memory amountsIn = [uint256(DAI_AMOUNT), uint256(USDC_AMOUNT)].toMemoryArray();
-        vm.prank(bob);
-        bptAmountOut = router.addLiquidityUnbalanced(address(pool), amountsIn, DAI_AMOUNT - DELTA, false, bytes(""));
+    function testGetWeightedPoolDynamicData() public view {
+        WeightedPoolDynamicData memory data = IWeightedPool(pool).getWeightedPoolDynamicData();
+        (, uint256[] memory tokenRates) = vault.getPoolTokenRates(pool);
+        IERC20[] memory tokens = IPoolInfo(pool).getTokens();
+        uint256 totalSupply = IERC20(pool).totalSupply();
 
-        // Tokens are transferred from Bob
-        assertEq(defaultBalance - usdc.balanceOf(bob), USDC_AMOUNT, "LP: Wrong USDC balance");
-        assertEq(defaultBalance - dai.balanceOf(bob), DAI_AMOUNT, "LP: Wrong DAI balance");
+        assertTrue(data.isPoolInitialized, "Pool not initialized");
+        assertFalse(data.isPoolPaused, "Pool paused");
+        assertFalse(data.isPoolInRecoveryMode, "Pool in Recovery Mode");
+        assertEq(data.totalSupply, totalSupply, "Total supply mismatch");
+        assertEq(data.staticSwapFeePercentage, DEFAULT_SWAP_FEE, "Swap fee mismatch");
 
-        // Tokens are stored in the Vault
-        assertEq(usdc.balanceOf(address(vault)), USDC_AMOUNT * 2, "Vault: Wrong USDC balance");
-        assertEq(dai.balanceOf(address(vault)), DAI_AMOUNT * 2, "Vault: Wrong DAI balance");
-
-        // Tokens are deposited to the pool
-        (, , uint256[] memory balances, , ) = vault.getPoolTokenInfo(address(pool));
-        assertEq(balances[0], DAI_AMOUNT * 2, "Pool: Wrong DAI balance");
-        assertEq(balances[1], USDC_AMOUNT * 2, "Pool: Wrong USDC balance");
-
-        // should mint correct amount of BPT tokens
-        assertApproxEqAbs(weightedPool.balanceOf(bob), bptAmountOut, DELTA, "LP: Wrong bptAmountOut");
-        assertApproxEqAbs(bptAmountOut, DAI_AMOUNT, DELTA, "Wrong bptAmountOut");
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            assertEq(data.balancesLiveScaled18[i], DEFAULT_AMOUNT, "Live balance mismatch");
+            assertEq(data.tokenRates[i], tokenRates[i], "Token rate mismatch");
+        }
     }
 
-    function testRemoveLiquidity() public {
-        vm.startPrank(bob);
-        router.addLiquidityUnbalanced(
-            address(pool),
-            [uint256(DAI_AMOUNT), uint256(USDC_AMOUNT)].toMemoryArray(),
-            DAI_AMOUNT - DELTA,
-            false,
-            bytes("")
-        );
+    function testDirectDeploymentWithLowMinimums() public {
+        WeightedPool.NewPoolParams memory params = WeightedPool.NewPoolParams({
+            name: "Direct Deploy",
+            symbol: "DD",
+            numTokens: 2,
+            normalizedWeights: [uint256(50e16), uint256(50e16)].toMemoryArray(),
+            version: "V1",
+            minTokenBalances: [uint256(1e12), uint256(1e5)].toMemoryArray()
+        });
 
-        weightedPool.approve(address(vault), MAX_UINT256);
-
-        uint256 bobBptBalance = weightedPool.balanceOf(bob);
-        uint256 bptAmountIn = bobBptBalance;
-
-        uint256[] memory amountsOut = router.removeLiquidityProportional(
-            address(pool),
-            bptAmountIn,
-            [uint256(less(DAI_AMOUNT, 1e4)), uint256(less(USDC_AMOUNT, 1e4))].toMemoryArray(),
-            false,
-            bytes("")
-        );
-
-        vm.stopPrank();
-
-        // Tokens are transferred to Bob
-        assertApproxEqAbs(usdc.balanceOf(bob), defaultBalance, DELTA, "LP: Wrong USDC balance");
-        assertApproxEqAbs(dai.balanceOf(bob), defaultBalance, DELTA, "LP: Wrong DAI balance");
-
-        // Tokens are stored in the Vault
-        assertApproxEqAbs(usdc.balanceOf(address(vault)), USDC_AMOUNT, DELTA, "Vault: Wrong USDC balance");
-        assertApproxEqAbs(dai.balanceOf(address(vault)), DAI_AMOUNT, DELTA, "Vault: Wrong DAI balance");
-
-        // Tokens are deposited to the pool
-        (, , uint256[] memory balances, , ) = vault.getPoolTokenInfo(address(pool));
-        assertApproxEqAbs(balances[0], DAI_AMOUNT, DELTA, "Pool: Wrong DAI balance");
-        assertApproxEqAbs(balances[1], USDC_AMOUNT, DELTA, "Pool: Wrong USDC balance");
-
-        // amountsOut are correct
-        assertApproxEqAbs(amountsOut[0], DAI_AMOUNT, DELTA, "Wrong DAI AmountOut");
-        assertApproxEqAbs(amountsOut[1], USDC_AMOUNT, DELTA, "Wrong USDC AmountOut");
-
-        // should mint correct amount of BPT tokens
-        assertEq(weightedPool.balanceOf(bob), 0, "LP: Wrong BPT balance");
-        assertEq(bobBptBalance, bptAmountIn, "LP: Wrong bptAmountIn");
+        vm.expectRevert(MinTokenBalanceLib.InvalidMinTokenBalance.selector);
+        new WeightedPool(params, vault);
     }
 
-    function testSwap() public {
-        vm.prank(bob);
-        uint256 amountCalculated = router.swapSingleTokenExactIn(
-            address(pool),
-            dai,
-            usdc,
-            DAI_AMOUNT_IN,
-            less(USDC_AMOUNT_OUT, 1e3),
-            MAX_UINT256,
-            false,
-            bytes("")
-        );
+    function testPoolCreator() public view {
+        PoolRoleAccounts memory roleAccounts = vault.getPoolRoleAccounts(pool);
 
-        // Tokens are transferred from Bob
-        assertEq(usdc.balanceOf(bob), defaultBalance + amountCalculated, "LP: Wrong USDC balance");
-        assertEq(dai.balanceOf(bob), defaultBalance - DAI_AMOUNT_IN, "LP: Wrong DAI balance");
-
-        // Tokens are stored in the Vault
-        assertEq(usdc.balanceOf(address(vault)), USDC_AMOUNT - amountCalculated, "Vault: Wrong USDC balance");
-        assertEq(dai.balanceOf(address(vault)), DAI_AMOUNT + DAI_AMOUNT_IN, "Vault: Wrong DAI balance");
-
-        (, , uint256[] memory balances, , ) = vault.getPoolTokenInfo(address(pool));
-
-        (uint256 daiIdx, uint256 usdcIdx) = getSortedIndexes(address(dai), address(usdc));
-
-        assertEq(balances[daiIdx], DAI_AMOUNT + DAI_AMOUNT_IN, "Pool: Wrong DAI balance");
-        assertEq(balances[usdcIdx], USDC_AMOUNT - amountCalculated, "Pool: Wrong USDC balance");
-    }
-
-    function less(uint256 amount, uint256 base) internal pure returns (uint256) {
-        return (amount * (base - 1)) / base;
-    }
-
-    function testAddLiquidityUnbalanced() public {
-        authorizer.grantRole(vault.getActionId(IVaultAdmin.setStaticSwapFeePercentage.selector), alice);
-        vm.prank(alice);
-        vault.setStaticSwapFeePercentage(address(pool), 10e16);
-
-        uint256[] memory amountsIn = [uint256(1e2 * 1e18), uint256(USDC_AMOUNT)].toMemoryArray();
-        vm.prank(bob);
-
-        router.addLiquidityUnbalanced(address(pool), amountsIn, 0, false, bytes(""));
+        assertEq(roleAccounts.poolCreator, alice, "Wrong pool creator");
     }
 }

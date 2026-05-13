@@ -4,11 +4,11 @@ runs:
   using: composite
   steps:
     - name: Install Node
-      uses: actions/setup-node@v3
+      uses: actions/setup-node@v4
       with:
-        node-version: 18.15
+        node-version: 24.12
     - name: Cache
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       id: cache
       with:
         path: '**/node_modules'
@@ -19,6 +19,8 @@ runs:
       if: steps.cache.outputs.cache-hit != 'true'
     - name: Install Foundry
       uses: foundry-rs/foundry-toolchain@v1
+      with:
+        version: v1.2.3
     - name: Install lcov
       shell: bash
       run: sudo apt-get install lcov

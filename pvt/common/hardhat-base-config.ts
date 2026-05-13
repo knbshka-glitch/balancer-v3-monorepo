@@ -4,20 +4,57 @@ import './skipFoundryTests.ts';
 type SolcConfig = {
   version: string;
   settings: {
+    viaIR: boolean;
+    evmVersion: string;
     optimizer: {
       enabled: boolean;
       runs?: number;
+      details: {
+        yulDetails: {
+          optimizerSteps: string;
+        };
+      };
     };
   };
 };
 
-export const compilers: [SolcConfig] = [
+// The coverage report doesn't work well with via-ir flags, so we disable it
+const viaIR = !(process.env.COVERAGE === 'true' ? true : false);
+export const DEFAULT_OPTIMIZER_STEPS =
+  'dhfoDgvulfnTUtnIf [ xa[r]EscLM cCTUtTOntnfDIul Lcul Vcul [j] Tpeul xa[rul] xa[r]cL gvif CTUca[r]LSsTFOtfDnca[r]Iulc ] jmul[jul] VcTOcul jmul : fDnTOcmu';
+
+const optimizerSteps = process.env.COVERAGE === 'true' ? ':' : DEFAULT_OPTIMIZER_STEPS;
+
+export const compilers: SolcConfig[] = [
   {
-    version: '0.8.24',
+    version: '0.8.26',
     settings: {
+      viaIR,
+      evmVersion: 'cancun',
       optimizer: {
         enabled: true,
         runs: 9999,
+        details: {
+          yulDetails: {
+            optimizerSteps: optimizerSteps,
+          },
+        },
+      },
+    },
+  },
+  {
+    version: '0.8.27',
+    settings: {
+      viaIR,
+      evmVersion: 'cancun',
+      optimizer: {
+        enabled: true,
+        runs: 9999,
+        details: {
+          yulDetails: {
+            optimizerSteps: optimizerSteps,
+          },
+        },
       },
     },
   },
@@ -26,19 +63,33 @@ export const compilers: [SolcConfig] = [
 type ContractSettings = Record<
   string,
   {
+    viaIR: boolean;
     version: string;
-    runs: number;
+    runs: number | undefined;
   }
 >;
 
+/* eslint-disable @typescript-eslint/no-non-null-assertion */
+
+const COMPILER_0_8_26 = compilers.find((compiler) => compiler.version === '0.8.26')!;
+
+/* eslint-enable @typescript-eslint/no-non-null-assertion */
+
 const contractSettings: ContractSettings = {
+  '@balancer-labs/v3-vault/contracts': {
+    version: COMPILER_0_8_26.version,
+    runs: COMPILER_0_8_26.settings.optimizer.runs,
+    viaIR,
+  },
   '@balancer-labs/v3-vault/contracts/Vault.sol': {
-    version: '0.8.24',
+    version: COMPILER_0_8_26.version,
     runs: 500,
+    viaIR,
   },
   '@balancer-labs/v3-vault/contracts/VaultExtension.sol': {
-    version: '0.8.24',
+    version: COMPILER_0_8_26.version,
     runs: 500,
+    viaIR,
   },
 };
 
@@ -53,6 +104,8 @@ export const warnings = {
     'code-size': 'warn' as WarningRule,
     'unused-param': 'warn' as WarningRule,
     'shadowing-opcode': 'off' as WarningRule,
+    'transient-storage': 'off' as WarningRule,
+    'initcode-size': 'off' as WarningRule,
     default: 'error' as WarningRule,
   },
 };
@@ -64,9 +117,16 @@ export const overrides = (packageName: string): Record<string, SolcConfig> => {
     overrides[contract.replace(`${packageName}/`, '')] = {
       version: contractSettings[contract].version,
       settings: {
+        viaIR: contractSettings[contract].viaIR,
+        evmVersion: 'cancun',
         optimizer: {
           enabled: true,
           runs: contractSettings[contract].runs,
+          details: {
+            yulDetails: {
+              optimizerSteps: optimizerSteps,
+            },
+          },
         },
       },
     };

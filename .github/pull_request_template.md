@@ -10,12 +10,14 @@
 - [ ] Breaking change <!-- (would cause existing functionality to not work as expected) -->
 - [ ] Dependency changes
 - [ ] Code refactor / cleanup
+- [ ] Optimization: [ ] gas / [ ] bytecode
 - [ ] Documentation or wording changes
 - [ ] Other
 
 ## Checklist:
 
 - [ ] The diff is legible and has no extraneous changes
+- [ ] Changeset is included <!-- run `yarn changeset` -->
 - [ ] Complex code has been commented, including external interfaces
 - [ ] Tests have 100% code coverage
 - [ ] The base branch is either `main`, or there's a description of how to merge

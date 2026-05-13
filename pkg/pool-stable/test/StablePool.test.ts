@@ -13,14 +13,26 @@ import TypesConverter from '@balancer-labs/v3-helpers/src/models/types/TypesConv
 import { deploy, deployedAt } from '@balancer-labs/v3-helpers/src/contract';
 import { StablePoolFactory } from '../typechain-types';
 import { MONTH } from '@balancer-labs/v3-helpers/src/time';
-import { MAX_UINT256 } from '@balancer-labs/v3-helpers/src/constants';
+import { MAX_UINT256, MAX_UINT160, MAX_UINT48, ZERO_ADDRESS } from '@balancer-labs/v3-helpers/src/constants';
 import * as expectEvent from '@balancer-labs/v3-helpers/src/test/expectEvent';
-import { PoolConfigStructOutput } from '@balancer-labs/v3-interfaces/typechain-types/contracts/vault/IVault';
+import {
+  PoolConfigStructOutput,
+  TokenConfigStruct,
+} from '@balancer-labs/v3-interfaces/typechain-types/contracts/vault/IVault';
 import { buildTokenConfig } from '@balancer-labs/v3-helpers/src/models/tokens/tokenConfig';
+import { deployPermit2 } from '@balancer-labs/v3-vault/test/Permit2Deployer';
+import { IPermit2 } from '@balancer-labs/v3-vault/typechain-types/permit2/src/interfaces/IPermit2';
 
 describe('StablePool', () => {
-  const TOKEN_AMOUNT = fp(1000);
+  const FACTORY_VERSION = 'Stable Factory v1';
+  const POOL_VERSION = 'Stable Pool v1';
+  const ROUTER_VERSION = 'Router v9';
 
+  const MAX_STABLE_TOKENS = 5;
+  const TOKEN_AMOUNT = fp(1000);
+  const MIN_SWAP_FEE = 1e12;
+
+  let permit2: IPermit2;
   let vault: IVaultMock;
   let router: Router;
   let alice: SignerWithAddress;
@@ -37,30 +49,41 @@ describe('StablePool', () => {
     vault = await TypesConverter.toIVaultMock(await VaultDeployer.deployMock());
 
     const WETH: WETHTestToken = await deploy('v3-solidity-utils/WETHTestToken');
-    router = await deploy('v3-vault/Router', { args: [vault, await WETH.getAddress()] });
+    permit2 = await deployPermit2();
+    router = await deploy('v3-vault/Router', { args: [vault, WETH, permit2, ROUTER_VERSION] });
 
-    factory = await deploy('StablePoolFactory', { args: [await vault.getAddress(), MONTH * 12] });
+    factory = await deploy('StablePoolFactory', {
+      args: [await vault.getAddress(), MONTH * 12, FACTORY_VERSION, POOL_VERSION],
+    });
 
-    tokens = await ERC20TokenList.create(4, { sorted: true });
+    tokens = await ERC20TokenList.create(MAX_STABLE_TOKENS, { sorted: true });
     poolTokens = await tokens.addresses;
 
     // mint and approve tokens
-    await tokens.asyncEach(async (token) => {
+    for (const token of tokens.tokens) {
       await token.mint(alice, TOKEN_AMOUNT);
-      await token.connect(alice).approve(vault, MAX_UINT256);
-    });
+      await token.connect(alice).approve(permit2, MAX_UINT256);
+      await permit2.connect(alice).approve(token, router, MAX_UINT160, MAX_UINT48);
+    }
   });
 
-  for (let i = 2; i <= 4; i++) {
+  for (let i = 2; i <= MAX_STABLE_TOKENS; i++) {
     itDeploysAStablePool(i);
   }
 
   async function deployPool(numTokens: number) {
+    const tokenConfig: TokenConfigStruct[] = buildTokenConfig(poolTokens.slice(0, numTokens));
+
     const tx = await factory.create(
       'Stable Pool',
       `STABLE-${numTokens}`,
-      buildTokenConfig(poolTokens.slice(0, numTokens)),
+      tokenConfig,
       200n,
+      { pauseManager: ZERO_ADDRESS, swapFeeManager: ZERO_ADDRESS, poolCreator: ZERO_ADDRESS },
+      MIN_SWAP_FEE,
+      ZERO_ADDRESS,
+      false, // no donations
+      false, // keep support to unbalanced add/remove liquidity
       TypesConverter.toBytes32(bn(numTokens))
     );
     const receipt = await tx.wait();
@@ -69,6 +92,7 @@ describe('StablePool', () => {
     const poolAddress = event.args.pool;
 
     pool = await deployedAt('StablePool', poolAddress);
+    await pool.connect(alice).approve(router, MAX_UINT256);
   }
 
   function itDeploysAStablePool(numTokens: number) {
@@ -77,6 +101,15 @@ describe('StablePool', () => {
 
       expect(await pool.name()).to.equal('Stable Pool');
       expect(await pool.symbol()).to.equal(`STABLE-${numTokens}`);
+    });
+
+    it('should have correct versions', async () => {
+      expect(await factory.version()).to.eq(FACTORY_VERSION);
+      expect(await factory.getPoolVersion()).to.eq(POOL_VERSION);
+
+      await deployPool(numTokens);
+
+      expect(await pool.version()).to.eq(POOL_VERSION);
     });
 
     describe(`initialization with ${numTokens} tokens`, () => {
@@ -116,10 +149,11 @@ describe('StablePool', () => {
         });
 
         it('has the correct pool tokens and balances', async () => {
-          const tokensFromPool = await pool.getPoolTokens();
+          const tokensFromPool = await pool.getTokens();
           expect(tokensFromPool).to.deep.equal(poolTokens.slice(0, numTokens));
 
           const [tokensFromVault, , balancesFromVault] = await vault.getPoolTokenInfo(pool);
+
           expect(tokensFromVault).to.deep.equal(tokensFromPool);
           expect(balancesFromVault).to.deep.equal(initialBalances);
         });
@@ -128,6 +162,11 @@ describe('StablePool', () => {
           await expect(router.connect(alice).initialize(pool, poolTokens, initialBalances, FP_ZERO, false, '0x'))
             .to.be.revertedWithCustomError(vault, 'PoolAlreadyInitialized')
             .withArgs(await pool.getAddress());
+        });
+
+        it('is registered in the factory', async () => {
+          expect(await factory.getPoolCount()).to.be.eq(1);
+          expect(await factory.getPools()).to.be.deep.eq([await pool.getAddress()]);
         });
       });
     });

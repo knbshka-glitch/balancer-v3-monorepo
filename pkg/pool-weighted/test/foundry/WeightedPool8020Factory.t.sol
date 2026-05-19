@@ -16,6 +16,7 @@ import { VaultContractsDeployer } from "@balancer-labs/v3-vault/test/foundry/uti
 import { ERC20TestToken } from "@balancer-labs/v3-solidity-utils/contracts/test/ERC20TestToken.sol";
 import { MinTokenBalanceLib } from "@balancer-labs/v3-vault/contracts/lib/MinTokenBalanceLib.sol";
 import { RateProviderMock } from "@balancer-labs/v3-vault/contracts/test/RateProviderMock.sol";
+import { BasicAuthorizerMock } from "@balancer-labs/v3-solidity-utils/contracts/test/BasicAuthorizerMock.sol";
 
 import { WeightedPoolContractsDeployer } from "./utils/WeightedPoolContractsDeployer.sol";
 import { WeightedPool8020Factory } from "../../contracts/WeightedPool8020Factory.sol";
@@ -29,8 +30,12 @@ contract WeightedPool8020FactoryTest is WeightedPoolContractsDeployer, VaultCont
     RateProviderMock rateProvider;
     ERC20TestToken tokenA;
     ERC20TestToken tokenB;
+    ERC20TestToken tokenC;
 
     address alice = vm.addr(1);
+    address governance = vm.addr(2);
+
+    event TokenConfigAllowlisted(TokenConfig tokenConfig);
 
     function setUp() public {
         vault = deployVaultMock();
@@ -38,21 +43,69 @@ contract WeightedPool8020FactoryTest is WeightedPoolContractsDeployer, VaultCont
 
         tokenA = new ERC20TestToken("Token A", "TKNA", 18);
         tokenB = new ERC20TestToken("Token B", "TKNB", 6);
+        tokenC = new ERC20TestToken("Token C", "TKNC", 18);
+
+        _grantSetTokenConfigPermissions(governance);
+        _allowlistTokenConfig(IERC20(tokenB), TokenType.STANDARD, IRateProvider(address(0)), false);
+    }
+
+    function _grantSetTokenConfigPermissions(address admin) internal {
+        BasicAuthorizerMock authorizer = BasicAuthorizerMock(address(factory.getAuthorizer()));
+        bytes32 actionId = factory.getActionId(WeightedPool8020Factory.allowlistTokenConfig.selector);
+        authorizer.grantRole(actionId, admin);
+    }
+
+    function _allowlistTokenConfig(
+        IERC20 lowWeightToken,
+        TokenType tokenType,
+        IRateProvider rateProviderValue,
+        bool yieldFeeExempt
+    ) internal {
+        TokenConfig memory lowWeightTokenConfig;
+        lowWeightTokenConfig.token = lowWeightToken;
+        lowWeightTokenConfig.tokenType = tokenType;
+        lowWeightTokenConfig.rateProvider = rateProviderValue;
+        lowWeightTokenConfig.yieldFeeExempt = yieldFeeExempt;
+        vm.prank(governance);
+        factory.allowlistTokenConfig(lowWeightTokenConfig);
     }
 
     function _createPool(IERC20 highToken, IERC20 lowToken) private returns (WeightedPool) {
-        TokenConfig[] memory tokenConfig = new TokenConfig[](2);
         PoolRoleAccounts memory roleAccounts;
-        tokenConfig[0].token = highToken;
-        tokenConfig[1].token = lowToken;
 
-        // The factory will sort the tokens.
-        return WeightedPool(factory.create(tokenConfig[0], tokenConfig[1], roleAccounts, DEFAULT_SWAP_FEE));
+        return WeightedPool(factory.create(highToken, lowToken, roleAccounts, DEFAULT_SWAP_FEE));
     }
 
     function testFactoryPausedState() public view {
         uint32 pauseWindowDuration = factory.getPauseWindowDuration();
         assertEq(pauseWindowDuration, 365 days);
+    }
+
+    function testTokenConfigReverts() public {
+        vm.expectRevert(WeightedPool8020Factory.TokenConfigNotAllowlisted.selector);
+        _createPool(tokenA, tokenC);
+    }
+
+    function testTokenConfigSetterAndGetter() public {
+        TokenConfig memory expectedTokenConfig;
+        expectedTokenConfig.token = tokenC;
+        expectedTokenConfig.tokenType = TokenType.WITH_RATE;
+        expectedTokenConfig.rateProvider = IRateProvider(address(10));
+        expectedTokenConfig.yieldFeeExempt = true;
+
+        vm.expectEmit(true, true, true, true, address(factory));
+        emit TokenConfigAllowlisted(expectedTokenConfig);
+
+        _allowlistTokenConfig(tokenC, TokenType.WITH_RATE, IRateProvider(address(10)), true);
+
+        TokenConfig memory tokenConfig = factory.getTokenConfig(tokenC);
+        assertEq(address(tokenConfig.token), address(expectedTokenConfig.token));
+        assertEq(uint256(tokenConfig.tokenType), uint256(expectedTokenConfig.tokenType));
+        assertEq(address(tokenConfig.rateProvider), address(expectedTokenConfig.rateProvider));
+        assertEq(tokenConfig.yieldFeeExempt, expectedTokenConfig.yieldFeeExempt);
+
+        TokenConfig memory nonAllowlistedConfig = factory.getTokenConfig(tokenA);
+        assertEq(address(nonAllowlistedConfig.token), address(0));
     }
 
     function testPoolFetching() public {
@@ -98,6 +151,9 @@ contract WeightedPool8020FactoryTest is WeightedPoolContractsDeployer, VaultCont
 
     function testPoolWithInvertedWeights() public {
         WeightedPool pool = _createPool(tokenA, tokenB);
+
+        _allowlistTokenConfig(tokenA, TokenType.STANDARD, IRateProvider(address(0)), true);
+
         WeightedPool invertedPool = _createPool(tokenB, tokenA);
 
         assertNotEq(
@@ -110,23 +166,14 @@ contract WeightedPool8020FactoryTest is WeightedPoolContractsDeployer, VaultCont
     function testPoolUniqueness() public {
         _createPool(tokenA, tokenB);
 
-        // Should not be able to deploy identical pool
         vm.expectRevert(Errors.FailedDeployment.selector);
         _createPool(tokenA, tokenB);
 
-        TokenConfig[] memory tokenConfig = new TokenConfig[](2);
-        PoolRoleAccounts memory roleAccounts;
+        // Trying to create the same pool with same highWeightToken but different token config should revert
+        _allowlistTokenConfig(tokenB, TokenType.WITH_RATE, IRateProvider(address(10)), true);
 
-        tokenConfig[0].token = tokenA;
-        tokenConfig[0].rateProvider = IRateProvider(address(1));
-        tokenConfig[0].tokenType = TokenType.WITH_RATE;
-        tokenConfig[1].token = tokenB;
-        tokenConfig[1].rateProvider = IRateProvider(address(2));
-        tokenConfig[1].tokenType = TokenType.WITH_RATE;
-
-        // Trying to create the same pool with same tokens but different token configs should revert
         vm.expectRevert(Errors.FailedDeployment.selector);
-        factory.create(tokenConfig[0], tokenConfig[1], roleAccounts, DEFAULT_SWAP_FEE);
+        _createPool(tokenA, tokenB);
     }
 
     /// forge-config: default.fuzz.runs = 10

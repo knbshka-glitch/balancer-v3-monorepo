@@ -30,6 +30,16 @@ contract WeightedPool8020Factory is IPoolVersion, BasePoolFactory, Version {
     uint256 private constant _TWENTY = 20e16; // 20%
 
     string private _poolVersion;
+    mapping(IERC20 => TokenConfig) private _allowlistedConfigs;
+
+    /// @dev The user has provided a lowWeightToken with no governance-allowed configuration.
+    error TokenConfigNotAllowlisted();
+
+    /**
+     * @notice Governance has allowlisted a new configuration for a token.
+     * @param tokenConfig The new allowlisted configuration of the token
+     */
+    event TokenConfigAllowlisted(TokenConfig tokenConfig);
 
     constructor(
         IVault vault,
@@ -47,24 +57,31 @@ contract WeightedPool8020Factory is IPoolVersion, BasePoolFactory, Version {
 
     /**
      * @notice Deploys a new `WeightedPool`.
-     * @dev Since tokens must be sorted, pass in explicit 80/20 token config structs. This assumes both tokens support
+     * @dev Since tokens must be sorted, pass in explicit 80/20 token addresses. This assumes both tokens support
      * the `IERC20Metadata` interface with `symbol` that returns a string. Otherwise, use the regular
      * `WeightedPoolFactory`.
      *
-     * @param highWeightTokenConfig The token configuration of the high weight token
-     * @param lowWeightTokenConfig The token configuration of the low weight token
+     * @param highWeightToken The token with 80% weight in the pool
+     * @param lowWeightToken The token with 20% weight in the pool
      * @param roleAccounts Addresses the Vault will allow to change certain pool settings
      * @param swapFeePercentage Initial swap fee percentage
      * @return pool The pool address
      */
     function create(
-        TokenConfig memory highWeightTokenConfig,
-        TokenConfig memory lowWeightTokenConfig,
+        IERC20 highWeightToken,
+        IERC20 lowWeightToken,
         PoolRoleAccounts memory roleAccounts,
         uint256 swapFeePercentage
     ) external returns (address pool) {
-        IERC20 highWeightToken = highWeightTokenConfig.token;
-        IERC20 lowWeightToken = lowWeightTokenConfig.token;
+        TokenConfig memory lowWeightTokenConfig = _allowlistedConfigs[lowWeightToken];
+        lowWeightToken = lowWeightTokenConfig.token;
+
+        if (address(lowWeightToken) == address(0)) {
+            revert TokenConfigNotAllowlisted();
+        }
+
+        TokenConfig memory highWeightTokenConfig;
+        highWeightTokenConfig.token = highWeightToken;
 
         TokenConfig[] memory tokenConfig = new TokenConfig[](2);
         uint256[] memory weights = new uint256[](2);
@@ -106,6 +123,23 @@ contract WeightedPool8020Factory is IPoolVersion, BasePoolFactory, Version {
         bytes32 salt = _calculateSalt(highWeightToken, lowWeightToken);
 
         pool = getDeploymentAddress(constructorArgs, salt);
+    }
+
+    /**
+     * @notice Gets the token configuration associated to the given token.
+     * @param lowWeightToken The token to fetch the configuration for.
+     */
+    function getTokenConfig(IERC20 lowWeightToken) external view returns (TokenConfig memory tokenConfig) {
+        tokenConfig = _allowlistedConfigs[lowWeightToken];
+    }
+
+    /**
+     * @notice Allowlists the token configuration for a given token.
+     * @param lowWeightTokenConfig The configuration of the token to be allowlisted.
+     */
+    function allowlistTokenConfig(TokenConfig calldata lowWeightTokenConfig) external authenticate {
+        _allowlistedConfigs[lowWeightTokenConfig.token] = lowWeightTokenConfig;
+        emit TokenConfigAllowlisted(lowWeightTokenConfig);
     }
 
     function _calculateSalt(IERC20 highWeightToken, IERC20 lowWeightToken) internal view returns (bytes32 salt) {
